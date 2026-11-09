@@ -30,6 +30,12 @@ Response (binary):
                [action_bytes])
 
 Example:
+    #开启 JAX 编译缓存（避免每次重启重复编译峰值）
+    JAX_ENABLE_COMPILATION_CACHE=1 \
+    JAX_COMPILATION_CACHE_DIR=$HOME/.cache/jax-compile \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    uv run deploy/policy_server.py
+
     python deploy/policy_server.py \
         --model-config config/v2/DACO_ft.yaml --host 127.0.0.1 --port 8765
 """
@@ -53,7 +59,7 @@ import numpy as np
 import websockets
 import yaml
 from pathlib import Path
-from utils.camera_preview import CameraPreview
+
 import openpi.transforms as _transforms
 from openpi.shared.nnx_utils import module_jit
 from openpi.training import checkpoints as _checkpoints
@@ -63,7 +69,7 @@ _SRC_ROOT = os.path.join(_CODEBASE_ROOT, "src")
 for _path in (_SRC_ROOT, _CODEBASE_ROOT):
     if _path not in sys.path:
         sys.path.insert(0, _path)
-
+from utils.camera_preview import CameraPreview
 from load_pi05 import load_pi05_model
 import mme_vla_suite.training.config as _train_config
 from mme_vla_suite.models.integration.history_observation import HistAugObservation
@@ -233,13 +239,10 @@ def _batch_input(value):
 
 
 class InferenceServer:
-    def __init__(self, model_config_path: str, checkpoint: str = None, prompt: str = "", seed: int = 42):
+    def __init__(self, checkpoint: str = None, prompt: str = "", seed: int = 42):
         if not prompt or not prompt.strip():
             raise ValueError("π0.5 需要语言指令，请通过 --prompt 传入。")
         self.prompt = prompt.strip()
-
-        with open(model_config_path, "r", encoding="utf-8") as stream:
-            self.config = yaml.safe_load(stream)
 
         loaded = load_pi05_model(config_name="pi05_realrobot", checkpoint_dir=checkpoint, seed=seed)
         device = _inference_device()
@@ -274,17 +277,34 @@ class InferenceServer:
             *data_config.data_transforms.outputs,
         ])
 
-        yaml_data = {"state_channels": ["state"], 
-                    "action_channels": ["actions"], 
-                    "image_channels": ["image"],}
+        # 契约通道。bridge 按此顺序拼接 state buffer、按此顺序切片 action 向量，
+        # 顺序必须与 scripts/build_realrobot_dataset.py 的 42 维约定一致:
+        #   state  = astribot.obs.joint_pos(18) + left_hand.obs.joint_pos(12) + right_hand.obs.joint_pos(12)
+        #   action = astribot.act.joint_pos(18) + left_hand.act.joint_pos(12) + right_hand.act.joint_pos(12)
+        yaml_data = {
+            "state_channels": [
+                "astribot.obs.joint_pos",
+                "left_hand.obs.joint_pos",
+                "right_hand.obs.joint_pos",
+            ],
+            "action_channels": [
+                "astribot.act.joint_pos",
+                "left_hand.act.joint_pos",
+                "right_hand.act.joint_pos",
+            ],
+            "image_channels": ["head_camera.obs.rgb"],
+        }
 
         self.state_channels = yaml_data["state_channels"]
         self.action_channels = yaml_data["action_channels"]
         self.image_channels = yaml_data["image_channels"]
         # self.tactile_channels = yaml_data["tactile_channels"]
         self.chunk_size = 20
-        self.action_dim = 42
+        self.action_dim = 42  # 模型输出维度 (body 18 + 左手 12 + 右手 12)
         self.obs_dim = 42
+        # bridge 契约维度: astribot.act.joint_pos(23) + 左手(12) + 右手(12) = 47。
+        # 模型 42 维在 body 18 之后补 5 个 0 (底盘 3 + 头部 2, 采集中锁死) 下发。
+        self.wire_action_dim = self.action_dim + 5
 
         # CUDA model execution is deliberately serialized.  asyncio may serve
         # multiple sockets, but concurrent calls into one model can cause large
@@ -330,9 +350,8 @@ class InferenceServer:
             "state_channels": self.state_channels,
             "action_channels": self.action_channels,
             "image_channels": self.image_channels,
-            # "tactile_channels": self.tactile_channels,
             "chunk_size": self.chunk_size,
-            "action_dim": self.action_dim,
+            "action_dim": self.wire_action_dim,  # 下发维度 (42 + 5 补位)
         }
 
     def check_hello(self, hello: dict):
@@ -353,28 +372,37 @@ class InferenceServer:
 
     @timeit
     def predict(self, header: dict, buffers: list[bytes]) -> np.ndarray:
-        if len(buffers) != len(self.state_channels) + len(self.image_channels):
+        # bridge 每帧发送: image_channels 顺序的 JPEG + 一个拼接 state buffer。
+        # 本配置无 tactile, 恒为 [jpeg, state] 两个 buffer。
+        expected_buffers = len(self.image_channels) + 1
+        if len(buffers) != expected_buffers:
             raise ValueError(
-                "expected [stereo_jpeg, state]"
+                f"expected {expected_buffers} buffers [images..., state], got {len(buffers)}"
             )
-        jpeg_buffer, state_buffer= buffers
+        jpeg_buffer, state_buffer = buffers
 
-        stereo = cv2.imdecode(np.frombuffer(jpeg_buffer, np.uint8), cv2.IMREAD_COLOR)
-        if stereo is None:
+        head_bgr = cv2.imdecode(np.frombuffer(jpeg_buffer, np.uint8), cv2.IMREAD_COLOR)
+        if head_bgr is None:
             raise ValueError("OpenCV could not decode stereo JPEG")
         if self.preview is not None:
-            self.preview.update(stereo)
-        height, width = stereo.shape[:2]
+            self.preview.update(head_bgr)
+        height, width = head_bgr.shape[:2]
         if height <= 0 or width <= 0 or width % 2:
-            raise ValueError(f"invalid side-by-side stereo image shape: {stereo.shape}")
+            raise ValueError(f"invalid side-by-side stereo image shape: {head_bgr.shape}")
 
         state = np.frombuffer(state_buffer, dtype=np.float64).astype(np.float32)
+        # bridge 按契约拼接: astribot 23 + 左手 12 + 右手 12 = 47 维。
+        # 训练数据丢弃 astribot 的 18:23 (底盘 3 + 头部 2, 采集中锁死),
+        # 裁为 42 = 身体 18 + 左手 12 + 右手 12。若 bridge 已裁好则原样使用。
+        if state.size == 47:
+            state = np.concatenate([state[:18], state[23:]])
         if state.size != self.obs_dim:
             raise ValueError(f"expected {self.obs_dim} state values, got {state.size}")
 
-        # 纯 π0.5 的 head 图：并排立体图的左半幅，作为 base_0_rgb。
-        middle = width // 2
-        head = cv2.cvtColor(stereo[:, :middle], cv2.COLOR_BGR2RGB)
+        # 纯 π0.5 的 head 图
+        head = cv2.cvtColor(head_bgr, cv2.COLOR_BGR2RGB)
+        if self.preview is not None:
+            self.preview.update(head_bgr)
 
         # --prompt 在这里 tokenize，并和图像、state 组成 sample_actions 的 observation。
         transformed = self._input_transform({
@@ -395,6 +423,17 @@ class InferenceServer:
         expected = (self.chunk_size, self.action_dim)
         if action.shape != expected:
             raise RuntimeError(f"model returned action shape {action.shape}, expected {expected}")
+        wire_pad = np.asarray([0.0, 0.8, 0.0, 0.0, 0.0], dtype="<f4")
+        assert wire_pad.size == self.wire_action_dim - self.action_dim
+        action = np.concatenate(
+            [
+                action[:, :18],
+                np.tile(wire_pad, (action.shape[0], 1)),
+                action[:, 18:],
+            ],
+            axis=1,
+        )
+
         return action
 
 
@@ -438,7 +477,7 @@ async def handle_connection(websocket, core: InferenceServer):
 
 
 async def main(args):
-    core = InferenceServer(args.model_config, checkpoint=args.checkpoint, prompt=args.prompt)
+    core = InferenceServer(checkpoint=args.checkpoint, prompt=args.prompt)
     preview_task = None
     if args.preview:
         core.preview = CameraPreview(label="deco_task7_stage1")
@@ -469,10 +508,11 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DECO WebSocket policy server")
     parser.add_argument("--model-config", default="")
-    parser.add_argument("--checkpoint", type=str, default="logs/deco_task7/deco_dino_80m_task7_epoch_500_loss_0.014794.pth", help="Stage1 checkpoint path")
+    parser.add_argument("--checkpoint", type=str, default="/home/zy/zhihao/Event-Graph-VLA/mme_vla_realrobot/runs/ckpts/pi05_realrobot/pi05_yu/39999", help="Stage1 checkpoint path")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--max-message-mb", type=int, default=20)
     parser.add_argument("--prompt", type=str, default=str("The right hand touches the red area on the trash bin to open the lid, and the left hand puts two red paper balls into the trash bin."), help="Uni task module name, e.g.")
     parser.add_argument("--preview", action="store_true", help="show received stereo frames in a local desktop window")
     asyncio.run(main(parser.parse_args()))
+
